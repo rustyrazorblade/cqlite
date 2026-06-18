@@ -461,7 +461,14 @@ impl SSTableRowIteratorAdapter {
     /// returns actual per-row timestamps decoded from the on-disk row headers.
     /// This allows the k-way merger to perform timestamp-accurate last-write-wins
     /// ordering, which is essential for tombstone shadowing (Issue #505).
-    fn open(path: &Path, run_index: usize) -> Result<Self> {
+    ///
+    /// When the schema has clustering columns, their values are extracted from
+    /// the decoded cells (by column name, in schema order) and stored on the
+    /// `MergeEntry.clustering_key` field so that `merge_partition_rows` can
+    /// group and reconcile distinct clustering rows correctly.  The clustering
+    /// columns are intentionally left in the cells as well, since the read-back
+    /// path expects them there.
+    fn open(path: &Path, run_index: usize, schema: &TableSchema) -> Result<Self> {
         use crate::platform::Platform;
         use crate::Config;
         use std::sync::Arc;
@@ -479,6 +486,9 @@ impl SSTableRowIteratorAdapter {
         config.storage.use_mmap = false;
         let path_buf = path.to_path_buf();
 
+        // Clone the schema so it can be moved into the async closure.
+        let schema_for_reader = schema.clone();
+
         // Open SSTable reader and load all partitions with actual row timestamps.
         let raw_entries = block_on_async(async move {
             let platform = Arc::new(Platform::new(&config).await?);
@@ -488,7 +498,15 @@ impl SSTableRowIteratorAdapter {
             // Use the compaction-specific path: returns (RowKey, Value, row_timestamp_micros).
             // Row/cell tombstones are emitted as Value::Tombstone with their actual
             // deletion timestamps so the merger can apply shadowing semantics (Issue #505).
-            reader.iterate_all_partitions_for_compaction(None).await
+            //
+            // Pass the schema so the parser uses the correct column names for clustering
+            // columns.  Without this, the fallback schema inferred from the serialization
+            // header uses generic names like "clustering_key" instead of the real CQL
+            // column names (e.g. "ck"), which then prevents extract_clustering_key from
+            // matching cell names to schema column names.
+            reader
+                .iterate_all_partitions_for_compaction(Some(&schema_for_reader))
+                .await
         })?;
 
         // Convert (RowKey, Value, timestamp) tuples to MergeEntry
@@ -498,10 +516,22 @@ impl SSTableRowIteratorAdapter {
             let decorated_key = DecoratedKey::from_key_bytes(key_bytes)?;
             let row_data = Self::value_to_row_data(&value, timestamp)?;
 
+            // Extract clustering key from cells when the schema has clustering columns.
+            // The values are present inside the decoded Value::Map as regular cells
+            // keyed by column name.  We build a ClusteringKey in schema order so that
+            // merge_partition_rows groups each (pk, ck) pair into its own bucket and
+            // reconcile_cluster produces the correct per-clustering-row output.
+            //
+            // Tombstone entries (no cells) are allowed to have None here — a
+            // partition-level or row tombstone without a decoded cell map may lack
+            // clustering column values, and grouping it under None is fine because
+            // reconcile_cluster handles that case gracefully.
+            let clustering_key = Self::extract_clustering_key(&row_data, schema);
+
             entries.push(MergeEntry::new(
                 run_index,
                 decorated_key,
-                None, // Clustering key extraction deferred
+                clustering_key,
                 timestamp,
                 row_data,
             ));
@@ -512,6 +542,48 @@ impl SSTableRowIteratorAdapter {
         Ok(Self {
             entries: entries.into_iter(),
         })
+    }
+
+    /// Extract a `ClusteringKey` from the row's live cells using the schema.
+    ///
+    /// For each clustering column declared in the schema (in position order),
+    /// look for a cell with that column name in the decoded `RowData::Live`
+    /// cells.  If all clustering columns are found, return `Some(ClusteringKey)`;
+    /// otherwise (including for tombstone entries that have no cells) return
+    /// `None`.
+    ///
+    /// The clustering columns are intentionally left inside the cells so the
+    /// downstream read-back path can still find them.
+    fn extract_clustering_key(row_data: &RowData, schema: &TableSchema) -> Option<ClusteringKey> {
+        if schema.clustering_keys.is_empty() {
+            return None;
+        }
+
+        let cells = match row_data {
+            RowData::Live { cells } => cells,
+            RowData::Tombstone { .. } => return None,
+        };
+
+        // Build the clustering key columns in schema order.
+        let mut ck_columns: Vec<(String, Value)> =
+            Vec::with_capacity(schema.clustering_keys.len());
+
+        for ck_col in &schema.clustering_keys {
+            let found = cells
+                .iter()
+                .find(|cell| cell.column == ck_col.name)
+                .map(|cell| (ck_col.name.clone(), cell.value.clone()));
+
+            match found {
+                Some(pair) => ck_columns.push(pair),
+                // If any clustering column is missing, we cannot form a valid
+                // ClusteringKey — return None so the row falls into the None
+                // bucket (treated as an unclustered row).
+                None => return None,
+            }
+        }
+
+        Some(ClusteringKey { columns: ck_columns })
     }
 
     /// Convert a reader Value to RowData.
@@ -652,7 +724,7 @@ impl KWayMerger {
         // Create run readers for each input SSTable (ordered newest to oldest)
         let mut runs = Vec::with_capacity(input_paths.len());
         for (run_index, path) in input_paths.iter().enumerate() {
-            let adapter = SSTableRowIteratorAdapter::open(path, run_index)?;
+            let adapter = SSTableRowIteratorAdapter::open(path, run_index, schema)?;
             runs.push(RunReader::new(Box::new(adapter)));
         }
 
