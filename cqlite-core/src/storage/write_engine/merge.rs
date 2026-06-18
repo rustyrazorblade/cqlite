@@ -565,8 +565,7 @@ impl SSTableRowIteratorAdapter {
         };
 
         // Build the clustering key columns in schema order.
-        let mut ck_columns: Vec<(String, Value)> =
-            Vec::with_capacity(schema.clustering_keys.len());
+        let mut ck_columns: Vec<(String, Value)> = Vec::with_capacity(schema.clustering_keys.len());
 
         for ck_col in &schema.clustering_keys {
             let found = cells
@@ -583,7 +582,9 @@ impl SSTableRowIteratorAdapter {
             }
         }
 
-        Some(ClusteringKey { columns: ck_columns })
+        Some(ClusteringKey {
+            columns: ck_columns,
+        })
     }
 
     /// Convert a reader Value to RowData.
