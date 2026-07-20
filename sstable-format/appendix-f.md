@@ -36,21 +36,25 @@ The `DataWriter` produces valid Cassandra 5.0 BIG format Data.db files with:
 
 ### CompressionInfo.db Writing
 
-**Status**: IMPLEMENTED
+**Status**: BUILDING BLOCKS (test-only)
 
-Full compression support via `CompressedDataWriter` and `CompressionInfoWriter`:
+CQLite's production SSTable writer emits uncompressed Data.db only. Compressed-write infrastructure exists to synthesize fixtures for the read path and is fail-closed for production — see #1406.
 
-- **LZ4**: Fast compression (default, requires `lz4` feature)
-- **Snappy**: Very fast compression (requires `snappy` feature)
-- **Deflate**: Better compression ratio (requires `deflate` feature)
-- **Zstd**: Balanced speed/ratio (requires `zstd` feature)
+The `CompressedDataWriter` and `CompressionInfoWriter` types are UNWIRED building blocks: no path from flush or compaction reaches them, and no Cassandra-side byte-parity coverage exists for a CQLite-emitted CompressionInfo.db. Any attempt to configure compressed production writing returns `Error::UnsupportedFormat`:
 
-CompressionInfo.db format includes:
-- Algorithm name with BE u16 length prefix
-- Chunk length (default 64KB)
-- Chunk offset table (u64 BE per chunk)
-- Per-chunk CRC32 checksums
-- Trailing metadata CRC32
+- `SSTableWriter::with_compression` and `CompressionInfoWriter::guard_unsupported_production_write` accept only `CompressionAlgorithm::None`; every real algorithm (LZ4, Snappy, Deflate, Zstd) errors.
+
+These building blocks are used solely to synthesize compressed SSTables for exercising the decompressing reader. The CompressionInfo.db binary format CQLite actually *parses* on read (see `cqlite-core/src/storage/sstable/compression_info.rs:132-249`, mirroring Cassandra's `CompressionMetadata.java:375-392`) is, in exact on-disk order:
+- Compressor simple name — Java `writeUTF`: BE `u16` byte-length prefix followed by the UTF-8 name (e.g. `LZ4Compressor`)
+- `option_count` — BE `i32`
+- `option_count` × option pairs — each pair is two `writeUTF` strings (key, then value), each a BE `u16` length prefix + UTF-8 bytes
+- `chunk_length` — BE `i32`, the uncompressed chunk size (default 64 KB)
+- `max_compressed_length` — BE `i32` (present on all Cassandra 5.0 / version ≥ `na` files; equals `i32::MAX` when `minCompressRatio=0`)
+- `data_length` — BE `i64`, total uncompressed data length
+- `chunk_count` — BE `i32`
+- `chunk_count` × chunk offset — BE `i64` per chunk, the byte offset of each compressed chunk record in Data.db
+
+CompressionInfo.db ends immediately after the chunk offset table — it contains **no CRC bytes**. The per-chunk CRC32 checksums live inline in Data.db: each compressed chunk is followed by a 4-byte big-endian CRC32 of its compressed bytes (`CompressedSequentialWriter.java:192`), so consecutive chunk offsets differ by `compressedLength + 4`. There is likewise no trailing metadata CRC32 in CompressionInfo.db.
 
 ### Frozen Collection Serialization
 
@@ -139,13 +143,11 @@ The following limitations from M5.0 have been resolved in M5.1:
 
 ### CompressionInfo.db Writing
 
-**Status**: RESOLVED (was "NOT IMPLEMENTED" in M5.0)
+**Status**: NOT IMPLEMENTED for production writes (building blocks are test-only, fail-closed — #1406)
 
-M5.0 produced only uncompressed SSTables. M5.1 implements full compression support with:
-- All four compression algorithms (LZ4, Snappy, Deflate, Zstd)
-- Chunk-based compression with configurable chunk size
-- Trailing CRC32 checksums per chunk
-- CompressionInfo.db metadata file generation
+CQLite's production SSTable writer emits uncompressed Data.db only and never writes a CompressionInfo.db. The `CompressedDataWriter` / `CompressionInfoWriter` types exist solely to synthesize compressed fixtures for exercising the decompressing reader; they are UNWIRED (no flush/compaction path reaches them) and any attempt to configure compressed production writing returns `Error::UnsupportedFormat`.
+
+The READ/decompression path fully supports all four compression algorithms (LZ4, Snappy, Deflate, Zstd) — CQLite reads compressed Cassandra SSTables end-to-end. See the "CompressionInfo.db Writing" entry under "M5.1 Write Support Capabilities" above for the exact fail-closed boundary and the parseable on-read format.
 
 ### Collection Serialization
 
@@ -271,11 +273,11 @@ CQLite has defined k-way merge compaction API with STCS (Size-Tiered Compaction 
 
 ### BTI Format Writing
 
-**Status**: NOT IMPLEMENTED
+**Status**: IMPLEMENTED (canonical `da` BTI write since v0.12 — #872)
 
-M5.1 produces BIG format SSTables only. BTI (trie-based) index writing is not supported.
+CQLite emits canonical BTI (`da`) format SSTables, including trie-based `Partitions.db` and `Rows.db`. BIG (`nb`) remains the DEFAULT write target; BTI (`da`) is an explicit, supported alternative. BTI read is fully supported end-to-end.
 
-**Rationale**: BTI is opt-in/experimental in Cassandra 5.0. BIG format covers >95% of production use cases.
+**Rationale**: BIG format covers the majority of production use cases and remains the default, while `da` BTI write/read achieves byte-parity with Cassandra 5.0 for callers that select it.
 
 ### Index.db/Summary.db Full Format
 
@@ -286,8 +288,9 @@ Current implementation:
 - Summary.db: Sampled entries with correct offset tracking
 
 Not implemented:
-- Full promoted index data in Index.db entries
-- BTI trie format
+- Full promoted index data in Index.db entries (BIG `nb` format)
+
+BTI (`da`) trie format write/read IS supported (see "BTI Format Writing" above).
 
 ### Statistics.db Full TOC Format
 
@@ -303,15 +306,67 @@ The `StatisticsWriter` produces a full Cassandra 5.0 compatible Statistics.db wi
 - SERIALIZATION_HEADER component (schema-derived or minimal stub)
 
 **Known Limitations**:
-- Column bitmap encoding limited to 64 columns (VUInt bitmap format; >64 columns requires different encoding)
 - STATS component uses minimal histograms (2 buckets, empty tombstone histogram)
 - COMPACTION component uses empty HyperLogLogPlus sketch (no cardinality data)
+
+**Wide tables (>64 columns) — supported (Issue #763)**:
+The SERIALIZATION_HEADER column sets are now written exactly as Cassandra's
+`SerializationHeader.Serializer.writeColumnsWithTypes`
+(cassandra-5.0.0 `SerializationHeader.java` lines 489-497): an unsigned-VInt column
+count followed by `count` `(VInt-length name, VInt-length marshal type)` pairs. This
+path has **no** 64-column limit. A previous note here claimed a "64-column bitmap"
+cap; that was inaccurate — the 64-bit bitmap encoding belongs to
+`Columns.serializer.serializeSubset` (`Columns.java` lines 503-531), which serialises
+a per-row column *subset* against a pre-shared superset (Data.db rows / inter-node
+messaging) and is never used for the SSTable header. Tables with 65+ columns therefore
+round-trip losslessly; regression coverage lives in
+`stats_writer.rs::tests::test_serialization_header_70_columns_roundtrip` and
+`test_serialization_header_200_columns_count_is_vint`.
 
 **Impact**: Statistics.db files are fully compatible with Cassandra 5.0. Schema can be provided explicitly for richer SerializationHeader, or omitted for minimal stub format.
 
 ---
 
 ## Parsing Limitations
+
+### Snapshot header-identity extraction — ID-less snapshot dirs (Issue #2384)
+
+**Status**: ⚠️ **Partial** — ID-ful (Cassandra-shaped) snapshots fully resolved; ID-less snapshots pending follow-up (#2415)
+**Impact**: Logging + sync schema-fallback identity only (does NOT affect the ticket-derived warm-cache key)
+
+Snapshot-aware path parsing (`cqlite-core/src/storage/sstable/snapshot_path.rs`) resolves the
+real `{keyspace}.{table}` identity from a Data.db path by walking up past a
+`snapshots/{tag}/` layer. Detection is guarded by the structural
+`{table_name}-{32-hex}` shape (`is_table_id_dir`) so it triggers ONLY for
+Cassandra-shaped, ID-ful snapshot directories
+(`.../{ks}/{table}-{id}/snapshots/{tag}/...-Data.db`). This correctly:
+- resolves the real `{keyspace}.{table}` for ID-ful Cassandra snapshots, and
+- avoids the false-trigger for an ordinary table living in a keyspace literally
+  named `snapshots` (`.../data/snapshots/{table}-{id}/...-Data.db`).
+
+**Residual limitation**: CQLite's own write engine emits **ID-less** table
+directories `{keyspace}/{table}/` (no `-{uuid}` suffix — `writer/mod.rs`). When
+those are snapshotted (e.g. the flight producer's
+`reads_from_snapshot_directory` path), the read path is
+`{ks}/{table}/snapshots/{tag}/...-Data.db`. Because `is_table_id_dir` requires a
+`-{32-hex}` suffix, an ID-less snapshot dir does NOT match the guard, the walk-up
+is skipped, and the header-identity misparse persists: keyspace resolves to
+`snapshots` and table to `{tag}`.
+
+This is **inherently unresolvable from the path alone** — an ID-less snapshot
+`{ks}/{table}/snapshots/{tag}/` and an ordinary table in a keyspace literally
+named `snapshots` (`{data}/snapshots/{table}/`) are structurally identical. Only
+external authoritative keyspace/table context can disambiguate them, and threading
+that context is the scope of the follow-up.
+
+**Blast radius**: header keyspace/table are used for logging and the sync
+schema-fallback path; the ID-less misparse does NOT corrupt the ticket-derived
+warm-cache key. The robust fix (authoritative keyspace/table threaded into the
+reader) is tracked as **#2415**.
+
+**Tracking**: Issue #2384 (structural fix, shipped) → follow-up #2415 (robust fix)
+
+---
 
 ### ~~Static Column Support (Exit Code 3)~~ - FIXED
 
@@ -450,7 +505,7 @@ With Issue #218 fixed, Summary.db now parses correctly. The remaining collection
 **Fix Details**:
 - Split `parse_row_header()` into `parse_row_flags()` + `parse_row_metadata()`
 - Parse clustering prefix immediately after flags, before row_size
-- File: `cqlite-core/src/storage/sstable/reader/parsing/v5_compressed_legacy.rs`
+- File: `cqlite-core/src/storage/sstable/reader/parsing/row_decoder.rs`
 
 **Results**:
 - Smoke test pass rate improved from 27% (9/33) to 79% (26/33)
@@ -534,48 +589,34 @@ if entries.is_empty() {
 
 ---
 
-### BTI End-to-End Validation (Issue #36 - Deferred to Post-M2)
+### BTI End-to-End Support (Issue #36 → resolved by v0.12 #872)
 
-**Status**: 🔄 **DEFERRED** (Issue #36)
-**Impact**: No full BTI parity testing against sstabledump
-**Decision**: BTI validation deferred to future milestone per team agreement
+**Status**: ✅ **RESOLVED** (canonical `da` BTI write/read since v0.12 — #872)
+**Note**: The narrative below is historical (the original Issue #36 deferral). It has since been superseded: BTI read is fully supported end-to-end, and CQLite emits canonical `da`-format SSTables (trie-based `Partitions.db`/`Rows.db`) with byte-parity vs Cassandra 5.0. BIG (`nb`) remains the DEFAULT write target.
 
-**Background**: Issue #36 requested comprehensive BTI validation including:
+**Historical background**: Issue #36 originally requested comprehensive BTI validation including:
 - TDD tests for trie traversal lookups and iteration
 - Rows.db decoding tests with range tombstones and complex types
 - Round-trip byte-comparable invariants
 - Zero-diff vs sstabledump on BTI datasets
 
-**Key Findings**:
+**Historical findings** (at time of deferral):
 1. **BIG format is Cassandra 5.0 default** - BTI requires explicit opt-in via `selected_format: bti` in cassandra.yaml
-2. **All test data uses BIG format** - 100% of 354 SSTable files use `nb-` prefix (BIG format)
-3. **0% BTI test data exists** - No Partitions.db/Rows.db trie files in test datasets
-4. **BTI is experimental** - Cassandra 5.0 marks BTI as opt-in, expected <5% production adoption
+2. **Test data used BIG format** - the original SSTable corpus used the `nb-` prefix (BIG format)
+3. **BTI is opt-in** - Cassandra 5.0 marks BTI as opt-in
 
-**Current Implementation** (~3,200 LOC in `cqlite-core/src/storage/sstable/bti/`):
+**Current implementation** (`cqlite-core/src/storage/sstable/bti/`):
 - ✅ Format detection (magic number `0x6461`)
 - ✅ Byte-comparable encoding (CEP-25 compliant)
 - ✅ Trie node structures (all 4 types)
 - ✅ SizedInts encoding
-- ⚠️ Trie traversal (stub implementation)
-- ❌ Range queries (not implemented)
-- ❌ Full partition iteration (not implemented)
+- ✅ Trie traversal (fully implemented)
+- ✅ Range queries and full partition iteration
+- ✅ Canonical `da` BTI write (`Partitions.db`/`Rows.db`) with Cassandra byte-parity (#872)
 
-**Decision Rationale**:
-- No BTI test data available for validation
-- BTI is opt-in/experimental in Cassandra 5.0
-- BIG format covers 100% of current test scenarios
-- Production BTI code preserved for future validation
+**Reference**: `docs/sstables-definitive-guide/references/bti-v1-status.md`
 
-**Future Work** (new issue when BTI demand emerges):
-1. Configure test cluster with `selected_format: bti`
-2. Generate real BTI SSTables (Partitions.db, Rows.db)
-3. Validate CQLite BTI parser vs sstabledump output
-4. Complete trie traversal implementation
-
-**Reference**: Full status documented in `docs/sstables-definitive-guide/references/bti-v1-status.md`
-
-**Tracking**: Issue #36 (DEFERRED - see issue comments for full discussion)
+**Tracking**: Issue #36 (resolved by v0.12 #872)
 
 ---
 
@@ -704,6 +745,169 @@ let data_offset = vint_offset;  // SSTableReader adds header_size later
 - Format detection needed to distinguish NB VInt from legacy length-prefixed
 
 **Tracking**: Issue #237
+
+---
+
+## Epic #817 — Compaction-fidelity gaps (verified)
+
+These limitations were surfaced and byte-verified during Epic #817 (compaction
+fidelity). Each is grounded in CQLite's own reader/writer or a cited Cassandra
+class; where CQLite diverges from Cassandra it is called out explicitly.
+
+### Reader lacks the `≥ 64`-column large-subset decode branch (#12)
+
+**Status**: 🐛 **OPEN**
+
+When `HAS_ALL_COLUMNS` (0x20) is clear, Cassandra's `Columns.Serializer.serializeSubset`
+(`Columns.java:503-531`) selects the columns-subset encoding by superset size: a single
+unsigned-VInt bitmap for `< 64` regular columns, and a **large-subset** form (VInt count +
+smaller-of present/missing **absolute** column indices, each an unsigned VInt — not deltas) for
+`≥ 64`. CQLite's reader
+(`reader/parsing/row_decoder.rs::parse_row_metadata`) always reads a single
+`parse_vuint` into a `u64` `missing_columns_bitmap` and has no `≥ 64` branch, so for a
+`≥ 64`-column table it consumes only the missing-count VInt and then mis-reads the trailing
+index VInts as cell data, corrupting the row stream. The reader also treats any column at
+`idx >= 64` as present regardless of the field. The **writer** implements both modes correctly
+(`data_writer.rs::write_column_subset`), pinned at the 63/64/65 boundary by
+`cqlite-core/tests/issue_824_column_subset_and_filter.rs`. **Workaround**: tables with fewer
+than 64 regular columns are unaffected (the common case).
+
+### Complex-column merge is whole-column, not per-cell-path (#14/#17/#18) — RESOLVED in epic #921
+
+**Status**: ✅ **RESOLVED** (#844 / #888 / #927 / #887, epic #921)
+
+**Was** (Epic #817): Cassandra merges complex (multi-cell collection/UDT) columns **per
+cell-path** using the column's path comparator — signed `ShortType` for a UDT field index,
+`TimeUUIDType` for a list element, the map key type for a map — applying shadow-before-purge per
+path. CQLite's merge (`storage/write_engine/merge.rs::reconcile_cluster`) reconciled by **whole
+column**: its `CellData` carried no cell-path, so per-path merge of multi-cell collections/UDTs
+was not representable.
+
+**Now** (epic #921): `reconcile_cluster` keys per-cell winners by `(column, cell_path)` and the
+`merge_entry_to_mutation` rewrite emits one `WriteComplexElement` per surviving element. Disjoint
+elements survive; a same-key collision resolves by the higher per-cell timestamp (#844). UDT field
+paths compare as **signed** `ShortType` (`compare_cell_paths`, field index `>= 32768` sorts
+negative) and complex columns match **by name** across differing source headers
+(#888 / #927; parity Cassandra `d14c96b8` / `5e636f9`). Complex deletion markers reconcile with
+strict-supersede (equal `markedForDeleteAt` does NOT supersede) and shadow-before-purge (elements
+with ts `<= markedForDeleteAt` are shadowed BEFORE the marker is purged) (#887; parity `bd244649`
++ `f66fa14f`). Non-frozen UDT multi-cell data now reads and writes end-to-end (#927). See
+Chapter 11 — "Compaction merge semantics". Authority:
+`org.apache.cassandra.db.rows.Cells` (per-column complex merge) and the column's `CellPath`
+comparator.
+
+### Equal-timestamp live-cell value tie-break diverges from Cassandra (#4/#21)
+
+**Status**: 🐛 **OPEN** (divergence; FIX ruled in #818, follow-up)
+
+At equal timestamp with two **live** cells (neither a tombstone), Cassandra's
+`Cells.resolveRegular` keeps the cell with the strictly-greater **raw value bytes** (unsigned
+lexicographic over the raw value, skipping the VInt length prefix). CQLite's
+`reconcile_cluster` keeps the **first-seen** cell (newest file by `run_index`) and does not
+compare value bytes — its `replace` predicate fires only for a higher timestamp or an
+equal-timestamp cell tombstone. Result: at an exact timestamp tie between two distinct live
+values, CQLite may keep a different value than Cassandra. Only PART of Cassandra's equal-ts
+hierarchy matches: a cell tombstone beats both a live and an expiring cell (rules 1–2). CQLite
+does NOT implement expiring-beats-pure-live or the `localDeletionTime`/TTL tie-breaks (rules
+3–4) — those are additional divergences (see Chapter 11). Authority:
+`org.apache.cassandra.db.rows.Cells.resolveRegular`.
+
+### Latent: RT / complex-deletion size VInt width (#25)
+
+**Status**: 🐛 **OPEN** (latent)
+
+Cassandra's `UnfilteredSerializer` writes certain marker/deletion sizes as `long` VInts where
+the corresponding read uses an `(int)` VInt (and vice versa) in places; CQLite's
+range-tombstone-marker and complex-column-deletion size fields must use the matching width or a
+large partition can mis-encode the size field. This is currently latent (small fixtures do not
+exceed the narrow width) but is a real width hazard to watch when writing large partitions.
+Authority: `org.apache.cassandra.db.rows.UnfilteredSerializer` (marker/row-body size fields).
+
+### AlwaysPresentFilter / absent `Filter.db` — handled (#23)
+
+**Status**: ✅ **HANDLED** (documented for completeness)
+
+A table created with `bloom_filter_fp_chance = 1.0` is backed by Cassandra's
+`AlwaysPresentFilter`, which serializes nothing — the SSTable has **no `Filter.db` component**.
+CQLite reads such tables correctly via **both** `scan` and `get`: the per-reader bloom gate
+(`reader/data_access.rs`) only consults `might_contain` when a filter is present, so an absent
+filter ("always maybe") never short-circuits a point lookup to `None`; `get` then falls back to
+the same stitched-chunk scan that `scan` uses. Verified by
+`cqlite-core/tests/issue_824_column_subset_and_filter.rs` (absent-`Filter.db` scan + get tests,
+which also strip the `Filter.db` TOC entry to faithfully reproduce the always-present case).
+
+---
+
+## Epic #921 — Compaction merge semantics (landed) and residual gaps
+
+Epic #921 made CQLite's compaction merge path act on metadata that earlier epics
+only carried. The merge behaviors are documented in full in Chapter 11 — "Compaction
+merge semantics"; this section records what is now **supported** and the limitations
+that **remain** after the epic, each verified against the code on the epic branch.
+
+### Non-frozen UDT multi-cell read+write — SUPPORTED (#927)
+
+**Status**: ✅ **SUPPORTED** end-to-end (was previously called out as unsupported)
+
+A non-frozen UDT is stored as a complex column with one cell per field, keyed by a
+2-byte **signed** `ShortType` declared field index. CQLite now reads such columns and
+writes them back through compaction: per-element winners reconcile by `(column,
+cell_path)`, field paths sort by signed `ShortType` (`compare_cell_paths`), and
+complex columns are matched **by name** so two sources with differing serialization
+headers merge the same logical column (#888 / #927; parity Cassandra `d14c96b8` /
+`5e636f9`). Any stale "non-frozen UDT unsupported" claim elsewhere is superseded by
+this entry.
+
+### Row-deletion + live-cells coexistence — NOT represented (#932)
+
+**Status**: 🐛 **OPEN** (limitation)
+
+A Cassandra row can carry a **row deletion** (`HAS_DELETION`) **and** surviving cells
+written strictly after the deletion timestamp at the same time. CQLite does not
+represent this: the V5CompressedLegacy reader collapses a `HAS_DELETION` row to a
+**pure tombstone** (it emits the row tombstone with an empty cell map and detects it
+via `RowHeader::is_row_tombstone`), and the merge `RowData` is an enum — `Tombstone`
+**xor** `Live`, never both. So a row tombstone that should coexist with newer
+surviving cells **loses the row deletion** (the surviving cells win and the deletion
+is dropped). Authority: `org.apache.cassandra.db.rows.Row` (a `Row` carries both a
+`Row.Deletion` and live cells). Tracked in **#932**.
+
+### Range tombstones during compaction — NOT applied/emitted (#933)
+
+**Status**: 🐛 **OPEN** (limitation)
+
+Range tombstones are not applied or emitted end-to-end in the compaction merge path.
+The V5CompressedLegacy reader **skips** range tombstone markers
+(`skip_range_tombstone_marker`) on the normal scan/compaction path — it does not
+surface a surviving marker to the merger (only the dedicated `delta-scan` path decodes
+them via `parse_range_tombstone_marker_full`), and `merge_entry_to_mutation` does not
+persist a surviving range marker into the rewritten output. Consequently a range
+tombstone is neither used to shadow covered rows during compaction nor re-emitted into
+the compacted SSTable. Authority:
+`org.apache.cassandra.db.rows.RangeTombstoneMarker` / `UnfilteredSerializer`. Tracked
+in **#933**.
+
+### gc_grace purging: overlap-aware in partial compactions (#935)
+
+**Status**: ✅ **RESOLVED** (#935; full-compaction fast path from #845 retained)
+
+gc_grace / `gcBefore` tombstone purging (#845, parity Cassandra `8d47ebb2`) runs on a
+**full/major** compaction (which spans every SSTable for the table) **and**, since
+**#935**, on a **partial / background** compaction when an overlap check proves the
+tombstone is safe to purge. The background path (`WriteEngine::maintenance_step`)
+computes a `max_purgeable_timestamp` — the minimum write timestamp
+(`markedForDeleteAt`, micros) across the **non-included overlapping** SSTables, read
+from their `Statistics.db` min-timestamp bound (`merge::compute_max_purgeable_timestamp`)
+— and threads it into the merger (`KWayMerger::with_max_purgeable_timestamp`). In
+`reconcile_cluster_with_overlap` a tombstone is purged only when BOTH its gc grace has
+elapsed (`localDeletionTime < gcBefore`) AND its own deletion timestamp is **strictly
+less** than that bound, so it provably shadows nothing outside the compaction set. A
+full compaction uses an `i64::MAX` (+∞) bound, identical to #845; a partial compaction
+with no readable overlap bound stays conservative and retains every tombstone (#921).
+In the one-shot CLI, purging remains opt-in via `--major` / `--purge-tombstones`
+(the explicit input list carries no table-wide overlap context). Authority:
+`org.apache.cassandra.db.compaction.CompactionController#maxPurgeableTimestamp` /
+`getPurgeEvaluator` (`time -> time < minTimestamp`).
 
 ---
 
@@ -971,24 +1175,24 @@ cargo build --no-default-features --features all-compression
 - **Issue #258**: V5CompressedLegacy Parser Errors for 15/33 Tables - **FIXED**
   - Status: ✅ FIXED - Two root causes identified and resolved
   - Root cause 1: Timestamp units mismatch in `parser/types.rs` - `parse_timestamp()` multiplied milliseconds by 1000 (converting to microseconds) but `Value::Timestamp(i64)` stores milliseconds. This caused overflow → negative values → `<invalid-timestamp:...>` markers.
-  - Root cause 2: Partition header flags heuristic in `v5_compressed_legacy.rs` - `flags > 0x20` check rejected valid partition headers with higher flag values, causing single-byte offset skip and cascading misalignment errors. Violated Issue #28 no-heuristics mandate.
+  - Root cause 2: Partition header flags heuristic in `row_decoder` - `flags > 0x20` check rejected valid partition headers with higher flag values, causing single-byte offset skip and cascading misalignment errors. Violated Issue #28 no-heuristics mandate.
   - Fix 1: Removed `* 1000` multiplication in `parser/types.rs:289` - now stores milliseconds directly
-  - Fix 2: Removed `flags > 0x20` heuristic check in `v5_compressed_legacy.rs:292` - validation now format-based only
+  - Fix 2: Removed `flags > 0x20` heuristic check in `row_decoder:292` - validation now format-based only
   - Result: All 33 test tables pass comprehensive SELECT tests with no ERROR messages or invalid data markers
-  - Files: `cqlite-core/src/parser/types.rs`, `cqlite-core/src/storage/sstable/reader/parsing/v5_compressed_legacy.rs`
+  - Files: `cqlite-core/src/parser/types.rs`, `cqlite-core/src/storage/sstable/reader/parsing/row_decoder.rs`
 
 - **Issue #240**: DATE Type Values Display as `<invalid-date:...>` - **FIXED**
   - Status: ✅ FIXED - DATE type now parses correctly in all contexts including map keys
-  - Root cause: `CqlType::Date` was mapped to `ComparatorType::Custom("date")` in `comparator.rs`, causing DATE values to fall through to blob parsing. Also, multiple parsing paths (parser/types.rs, v5_compressed_legacy.rs) read DATE as raw i32 without Cassandra's Integer.MIN_VALUE offset decoding.
+  - Root cause: `CqlType::Date` was mapped to `ComparatorType::Custom("date")` in `comparator.rs`, causing DATE values to fall through to blob parsing. Also, multiple parsing paths (parser/types.rs, row_decoder) read DATE as raw i32 without Cassandra's Integer.MIN_VALUE offset decoding.
   - Fix:
     1. Added `ComparatorType::Date` variant to comparator.rs with proper comparison support
     2. Updated `from_cql_type()` and `from_cql_type_with_registry()` to map `CqlType::Date` → `ComparatorType::Date`
     3. Added DATE parsing arm to `parse_value_with_schema_type()` and `parse_value_with_comparator()` in value_parsing.rs
     4. Fixed `parse_date()` in parser/types.rs to apply Cassandra DATE encoding: `stored.wrapping_add(i32::MIN as u32) as i32`
-    5. Fixed map key DATE parsing in v5_compressed_legacy.rs line 5327
+    5. Fixed map key DATE parsing in row_decoder line 5327
   - Cassandra DATE encoding: 4-byte big-endian unsigned int shifted by Integer.MIN_VALUE (2^31) for byte-order comparability. Decoding adds i32::MIN back.
   - Result: DATE columns and DATE keys in maps now display as `YYYY-MM-DD` format (e.g., `2025-10-05`) instead of `<invalid-date:...>`
-  - Files: `comparator.rs`, `value_parsing.rs`, `comparator_value_parsing.rs`, `key_digest.rs`, `parser/types.rs`, `v5_compressed_legacy.rs`
+  - Files: `comparator.rs`, `value_parsing.rs`, `comparator_value_parsing.rs`, `key_digest.rs`, `parser/types.rs`, `row_decoder`
 
 - **Issue #238**: UDTs Inside Collections Not Parsed - **FIXED**
   - Status: ✅ FIXED - Extended `parse_value_with_comparator` for recursive type parsing
@@ -1007,7 +1211,7 @@ cargo build --no-default-features --features all-compression
     2. Added `parse_inline_udt_value()` function to parse UDTs using inline field definitions when registry lookup fails
     3. Modified all `CqlType::Udt(udt_name, inline_fields)` pattern matches to use `inline_fields` as fallback
   - Result: Nested UDTs like `contact_info.address` now show parsed field values (`{street, city, state, zip_code, country}`) instead of `0x...` blobs
-  - File: `cqlite-core/src/storage/sstable/reader/parsing/v5_compressed_legacy.rs`
+  - File: `cqlite-core/src/storage/sstable/reader/parsing/row_decoder.rs`
 
 ### Completed Issues (Fixed - Dec 2025)
 
@@ -1256,22 +1460,19 @@ The `StatisticsWriter` now produces complete Cassandra 5.0 compatible Statistics
 
 ---
 
-### ~~CompressionInfo.db Not Implemented~~ - RESOLVED
+### CompressionInfo.db Writing — production writes NOT implemented (test-only, fail-closed)
 
-**Status**: ✅ **RESOLVED** (M5.1)
-**Resolution**: Full compression support implemented in M5.1
+**Status**: ⚠️ Production write NOT implemented; READ/decompression fully supported (#1406)
 
-M5.0 produced only uncompressed SSTables. M5.1 implements full compression support via:
-- `CompressedDataWriter`: Chunk-based compression with LZ4/Snappy/Deflate/Zstd
-- `CompressionInfoWriter`: Compression metadata file generation
-- Trailing CRC32 checksums per chunk
-- Feature-gated compression algorithms
+CQLite's production SSTable writer emits uncompressed Data.db only and never writes a CompressionInfo.db. The `CompressedDataWriter` / `CompressionInfoWriter` types are UNWIRED building blocks that synthesize compressed fixtures for the decompressing reader; configuring compressed production writing returns `Error::UnsupportedFormat`.
 
-See "M5.1 Write Support Capabilities" section at the top of this document for details.
+The READ path fully supports all four algorithms (LZ4, Snappy, Deflate, Zstd) — CQLite reads compressed Cassandra SSTables end-to-end.
 
-**Files Added**:
-- `cqlite-core/src/storage/sstable/writer/compressed_data_writer.rs`
-- `cqlite-core/src/storage/sstable/writer/compression_info_writer.rs`
+See "M5.1 Write Support Capabilities" section at the top of this document for the exact fail-closed boundary.
+
+**Files**:
+- `cqlite-core/src/storage/sstable/writer/compressed_data_writer.rs` (test-only building block)
+- `cqlite-core/src/storage/sstable/writer/compression_info_writer.rs` (test-only building block)
 
 ---
 
@@ -1281,7 +1482,7 @@ See "M5.1 Write Support Capabilities" section at the top of this document for de
 - All SSTable component parsers (Data.db, Index.db, Summary.db, Statistics.db) now use correct formats
 - All data types fully supported: basic types, collections, UDTs, frozen types, complex cells
 - **M5.1 Write Support**: Feature-complete with documented trade-offs
-  - ✅ CompressionInfo.db: Full compression support (LZ4, Snappy, Deflate, Zstd)
+  - ⚠️ CompressionInfo.db: production writer emits uncompressed Data.db only; compressed-write infra is test-only/fail-closed (#1406). READ/decompression fully supports LZ4, Snappy, Deflate, Zstd
   - ✅ Collection serialization: Frozen and non-frozen collections
   - ✅ Static columns: Extended flags format with EXTENDED_IS_STATIC
   - ✅ Composite partition keys: Multi-component encoding
@@ -1294,7 +1495,7 @@ See "M5.1 Write Support Capabilities" section at the top of this document for de
   - ✅ Issue #219: Frozen type support
   - ✅ Issue #220: UDT (User-Defined Type) support
   - ✅ Issue #221: Complex cell flag handling for non-frozen collections
-- **Milestone achieved**: M5.1 completion (write support with compression, collections, static columns)
+- **Milestone achieved**: M5.1 completion (uncompressed SSTable write support, collections, static columns). Compression is read-only — the production writer emits uncompressed Data.db; compressed-write infra is test-only/fail-closed (#1406)
 
 ---
 

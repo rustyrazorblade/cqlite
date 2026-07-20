@@ -3,7 +3,7 @@ title: Test Data
 description: Fetching the dataset, dataset pins, CQLITE_DATASETS_ROOT, and what happens without Data.db files.
 sidebar:
   label: Test data
-  order: 3
+  order: 4
 ---
 
 The git repository contains only JSONL reference files (sstabledump output, used for
@@ -26,16 +26,16 @@ The fetch script uses these defaults (override with environment variables):
 
 ```bash
 DATASET_TAG=datasets-v3
-DATASET_ASSET=cassandra5-small-full-v3.1.tar.gz
-DATASET_SHA256=f5fa0b6599a27c1c493d7c6c063194d55d031cab417396947313e7245afc5ceb
+DATASET_ASSET=cassandra5-small-full-v3.4.tar.gz
+DATASET_SHA256=3cae644360e0142a6bb5e96ddab445ff18e3478e7058104842ce1a455fba8a33
 ```
 
 CI reads the same pins from `.github/workflows/sstabledump-parity-gate.yml`:
 
 ```yaml
 DATASET_TAG: datasets-v3
-DATASET_ASSET: cassandra5-small-full-v3.1.tar.gz
-DATASET_SHA256: f5fa0b6599a27c1c493d7c6c063194d55d031cab417396947313e7245afc5ceb
+DATASET_ASSET: cassandra5-small-full-v3.4.tar.gz
+DATASET_SHA256: 3cae644360e0142a6bb5e96ddab445ff18e3478e7058104842ce1a455fba8a33
 ```
 
 **Why SHA256 is the cache key**: CI caches the extracted dataset by SHA256. Using the
@@ -43,11 +43,15 @@ tag name as the cache key would allow a re-published asset (same tag, different
 content) to serve stale data. The SHA256 is content-addressed — cache hit means the
 exact bytes are correct.
 
-**Why v3.1 rather than v3**: The v3 tarball was produced on macOS and contained
-AppleDouble entries. v3.1 was repackaged with `--exclude='*/._*'` to strip them.
-When inspecting or repackaging archives, use Python's `tarfile` module (platform-
-neutral) rather than `tar -tf` (macOS bsdtar hides `._*` on listing and re-embeds
-them on repack).
+**Why v3.2 (asset history)**: The v3 tarball was produced on macOS and contained
+AppleDouble entries; v3.1 was repackaged with `--exclude='*/._*'` to strip them.
+v3.2 (issue #1099) republished the corpus to include the Epic #970 `test_comp` +
+`corruption/test_comp_corrupt` fixtures, which `issue_1000_verifier` requires —
+the v3.1 asset predated those fixtures, so the `test` lane could only clean-skip
+that coverage. All assets share the `datasets-v3` tag (it holds multiple versions;
+the SHA256 pin selects the exact bytes). When inspecting or repackaging archives,
+use Python's `tarfile` module (platform-neutral) rather than `tar -tf` (macOS
+bsdtar hides `._*` on listing and re-embeds them on repack).
 
 ## CQLITE_DATASETS_ROOT
 

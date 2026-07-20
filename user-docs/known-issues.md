@@ -8,7 +8,7 @@ sidebar:
 
 # Known Issues
 
-This page tracks **active bugs and sharp edges** in the current release (`v0.11.0`).
+This page tracks **active bugs and sharp edges** in the current release (`v0.13.0`).
 It is deliberately short and honest: if something here bites you, you are not doing
 it wrong.
 
@@ -19,7 +19,7 @@ it wrong.
   [**Open an issue**](https://github.com/pmcfadin/cqlite/issues/new/choose) — that is
   the single most useful thing you can do for the project.
 
-_Last reviewed: 2026-06-17 (v0.11.0)._
+_Last reviewed: 2026-07-05 (v0.13.0)._
 
 ## Python bindings
 
@@ -52,16 +52,6 @@ Reading SSTables written by Cassandra is unaffected — this only concerns the C
 write path. The promoted-index writer and BTI-based O(log n) seeks are on the
 [roadmap](/cqlite/user-docs/roadmap/) (epic
 [#751](https://github.com/pmcfadin/cqlite/issues/751)).
-
-## Format coverage
-
-### BTI (`da`) SSTables are rejected, not read
-
-BTI/trie-index SSTables (`da-*-bti-*`, opt-in in Cassandra 5.0) are detected and
-rejected with a clear error rather than misread. This is by design until the
-dedicated BTI read path lands — see
-[Limitations](/cqlite/user-docs/limitations/) and roadmap item
-[#660](https://github.com/pmcfadin/cqlite/issues/660).
 
 ## Reporting something new
 

@@ -8,7 +8,7 @@ sidebar:
 
 # CLI Reference
 
-This page is built from the actual `cqlite --help` output (binary version 0.11.0, built with `--features write-support`). Every example on this page was run against the real test datasets (`cassandra5-small-full-v3.1`).
+This page is built from the actual `cqlite --help` output (binary version 0.13.0, built with `--features write-support`). Every example on this page was run against the real test datasets (`cassandra5-small-full-v3.1`).
 
 ## Synopsis
 
@@ -577,6 +577,40 @@ cqlite \
 For write statistics, compaction, and export see the `write-stats`, `maintenance`, and `export-sstable` subcommands above.
 
 ---
+
+## Debug / test controls
+
+### `CQLITE_READ_PATH` — force the SELECT access path
+
+`CQLITE_READ_PATH` forces every `SELECT` down a specific read access path. It is a
+**test and debugging control** — **not a performance recommendation** — used to remove
+doubt about which path served a query and to differentially compare the two paths.
+
+| Value | Behavior |
+|-------|----------|
+| `auto` (default, or unset) | The engine chooses point-vs-full per query, exactly as normal. Byte-for-byte identical to leaving the knob unset. |
+| `point` | Force a genuinely partition-targeted lookup. **Fails closed** — the query returns an error whenever it would not run a partition-targeted lookup (a partial/absent partition key, an unwired targeted surface, or a path that does not actually prune). It **never** silently falls back to a full scan. |
+| `full` | Force the full-scan + reconciliation path regardless of classification. Returns the same rows/values/order as `auto` for the same query. |
+
+The value is case-insensitive (`auto`/`point`/`full`). An **unrecognized** value is a loud
+error naming the value and the allowed set — never a silent fall-through to `auto`. The
+programmatic equivalent is the `QueryConfig.forced_read_path` field, which takes precedence
+over the environment variable. The mode is resolved once per process.
+
+```bash
+# Force a point lookup; errors loudly if the query is not partition-targeted.
+CQLITE_READ_PATH=point cqlite \
+  --schema schema.cql --data-dir ./sstables \
+  -e "SELECT * FROM ks.tbl WHERE pk = 1" --out json
+
+# Force a full scan of the same query (rows/values/order match the point path).
+CQLITE_READ_PATH=full cqlite \
+  --schema schema.cql --data-dir ./sstables \
+  -e "SELECT * FROM ks.tbl WHERE pk = 1" --out json
+```
+
+Forcing changes **routing only** — value decoding, tombstone/timestamp reconciliation, and
+WRITETIME/TTL semantics are identical across all three modes.
 
 ## Logging
 

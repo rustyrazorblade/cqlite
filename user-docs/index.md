@@ -30,9 +30,12 @@ daemon required.
 ### Topics
 
 - [Write Support](/cqlite/user-docs/write-support/) — offline SSTable writing, flush, compaction (M5)
+- [Read Surfaces and Freshness](/cqlite/user-docs/read-surfaces-and-freshness/) — snapshot-at-open, `refresh()`, and torn-window semantics per surface
+- [Observability](/cqlite/user-docs/observability/) — runtime OpenTelemetry traces/metrics, local stack, config, metric catalog
 - [Limitations](/cqlite/user-docs/limitations/) — what CQLite can and cannot read (format matrix, known gaps)
 - [Troubleshooting](/cqlite/user-docs/troubleshooting/) — common problems and fixes
 - [Use Cases](/cqlite/user-docs/use-cases/) — Cassandra sidecar, data science, services, operational scenarios
+- [Performance](/cqlite/user-docs/performance/) — measured cqlite-flight field results and the owner-ratified performance goals ladder
 
 ## Quick links
 
