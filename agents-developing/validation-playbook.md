@@ -77,6 +77,151 @@ The `CQLITE_READ_PATH` knob is a **test/debug** control (not a perf recommendati
 `point` fails closed rather than silently full-scanning. See the CLI reference for the
 user-facing knob docs.
 
+#### Fixture roots resolve per TABLE, and committed cases must RUN (issue #3220)
+
+A dataset lane that picks its corpus root by **keyspace** can pass without ever running.
+Three lanes did exactly that (`point_vs_full_differential`, `query_semantics_oracle_parity`,
+`read_path_forcing_e2e`): each selected the first candidate root whose `<keyspace>/` was a
+directory and then **committed to it with no fallback**, although what each needs is a
+specific **table**. On a machine whose `CQLITE_DATASETS_ROOT` corpus held `test_da/` but
+not the git-committed `test_da/multiclustering_table-*`, the env root won, the table was
+declared absent, and the #3032 multi-component clustering case **skipped silently** behind
+a green suite.
+
+Two rules now close it, and both apply to any new dataset lane:
+
+* **Resolve TABLE-granularly.** `cqlite-core/tests/support/datasets_root.rs` —
+  `sstables_root_for_table(keyspace, table)` walks *every* candidate root
+  (`CQLITE_DATASETS_ROOT`, then the checkout's committed corpus) and returns the first that
+  actually carries `<keyspace>/<table>-*/…-Data.db`. Presence is judged on a real `*-Data.db`
+  component, never on directory existence: the repo commits JSONL sidecars for fixtures whose
+  binaries are gitignored. Schemas keep resolving checkout-relative through
+  `test-data/support/fixture_roots.rs` (#3148) — never by climbing `..` from the datasets root.
+* **Assert per CASE, not suite-wide.** `assert!(ran > 0)` over a whole corpus cannot see one
+  case skipping behind its siblings. Every case whose binaries are **committed to git** carries
+  `must_run: true` and is fail-closed **unconditionally** (with or without
+  `CQLITE_REQUIRE_FIXTURES`, because `core-tests` does not set it); under
+  `CQLITE_REQUIRE_FIXTURES=1` *every* case must run, matching the query-semantics oracle's
+  per-case `assert!(skipped.is_empty())`.
+
+**Resolve by evidence, not by preference — and why no ordering can be fixed here.** Neither root is
+a superset of the other. Measured on a fleet box, `/data/datasets` holds 144 `*-Data.db` across 122
+tables but lacks the one git-committed `test_da/multiclustering_table`; the checkout holds only its
+31 committed parity references, which include it. Env-first loses that committed fixture,
+checkout-first loses 92 fetched tables — so a *preference ordering* is wrong for one set of tables
+whichever way you point it, and only "walk every candidate, take the first that actually holds THIS
+table's `*-Data.db`" is right for both. That supersedes issue **#3104**'s suggested "prefer the
+already-exported `CQLITE_DATASETS_ROOT`" fix **for the lanes on this resolver**. #3104 stays **open**
+for the work the resolver does not reach: the whole-corpus `#2078` preflight fail-close, a diagnostic
+naming the found `Data.db` count and the overridden candidate root, the `--lite`
+implausibly-small-corpus warning, and the CLAUDE.md / flow-* / `agents-developing/test-data` text
+that still tells agents to override the exported root with the checkout path.
+
+Defense in depth: the agent-gate `bti-multiclustering` component also runs
+`point_vs_full_differential`, so the committed BTI fixtures are covered by a fail-closed gate
+component rather than by `core-tests` alone.
+
+#### Second axis: 1 generation vs N generations (issue #3129)
+
+The point-vs-full comparison above holds the **generation count fixed**, so both of its
+arms route through the same reconciliation kernel and a disagreement between the
+*single-generation* read path and the *cross-generation* merge kernel
+(`generation_merge.rs`) reproduces identically on both arms — the lane stays green while a
+real `SELECT`'s answer depends on the table's compaction state. That is a fourth blind
+spot alongside physical-dump parity, query-semantics parity, and the self-round-trip class.
+
+`cqlite-core/tests/point_vs_full_differential/one_vs_n_generation.rs` (a submodule of the
+same test target) closes it: for each corpus fixture that holds **exactly one
+Cassandra-written generation**, it materializes two temp trees from those same bytes — one
+generation, and the same generation copied N ≥ 2 times under distinct generation numbers —
+then requires identical rows/values/**order** from both trees for the full scan, every
+per-partition read under both forced read-path modes, and the multi-key `IN`, at the same
+pinned `now`. N identical copies reconcile to exactly one copy under Cassandra's rules, so
+any inequality is a merge-kernel (or single-gen) defect. Anti-vacuity: each case pins the
+exact full-scan row count and partition count, both arms' generation counts are re-scanned
+after materialization (so the axis can never degenerate to 1-vs-1), and a source fixture
+that stops holding exactly one generation FAILs.
+
+Two properties of this axis are easy to get wrong:
+
+* **It probes partitions that return NOTHING, on purpose.** Discovery runs
+  `SELECT <pk> FROM …`, so a fully-deleted partition yields no key and would never be point-read
+  — leaving the seek/merge path untested for exactly the deleted-partition phantom-row shape the
+  axis exists to catch. Each case therefore declares `empty_probe_keys` (deleted or absent
+  partitions), asserted to be undiscoverable AND to return zero rows on both arms in both modes.
+* **It covers structural merge, not precedence.** The N copies are byte-identical, so every
+  cross-generation comparison is a *tie*: interleaving, ordering, dedup, static injection and
+  tombstone application are exercised, but "a newer generation's tombstone shadows an older
+  generation's live row" is not. That asymmetric class belongs to the real 2-generation
+  Cassandra fixtures (`test_tomb.resurrection_gc0`, `skipped_partition_delete`) and the
+  Cassandra-oracle lanes.
+
+**A quarantine needs a release signal.** Shapes that already diverge for a tracked defect are
+marked `known_divergent` with a reason that MUST cite its issue (`#<number>`, asserted — a
+waiver with no cited issue is not a waiver). They are excluded from the enforcing lane, but they
+are NOT parked in an `#[ignore]`d reproducer: an ignored test is a ratchet that never releases,
+since the gate never runs it and nothing ever reports that the defect got fixed. Instead
+`one_vs_n_generation_quarantine_still_diverges` runs in the normal test run and pins the
+*expected divergence*: each quarantined case must STILL diverge, and the moment one starts
+agreeing the test fails with instructions to flip `known_divergent` to `None`. Only an error
+carrying the divergence marker counts — a harness/fixture error is reported separately, so a
+broken harness can never masquerade as "still broken":
+
+```bash
+env CQLITE_REQUIRE_FIXTURES=1 CQLITE_DATASETS_ROOT=$PWD/test-data/datasets \
+  cargo test -p cqlite-core --features "state_machine cli-helpers" \
+  --test point_vs_full_differential -- one_vs_n_generation_quarantine_still_diverges --nocapture
+```
+
+Generalizing: when a test must be excluded because of a known defect, prefer an
+**expected-failure pin that fails when the defect disappears** over `#[ignore]`. The former
+self-releases; the latter is green whether the code is broken or fixed.
+
+### The self-round-trip blind spot (CQLite-written + CQLite-read, issue #3042)
+
+Both lanes above compare CQLite against an *external* oracle or against its own two read
+paths. A third class of test compares CQLite only to itself in a single direction — write
+with CQLite, read back with CQLite, assert the values survived — and it carries a blind spot
+severe enough to name explicitly:
+
+> **A CQLite-written + CQLite-read round-trip test is INVARIANT to a uniform
+> framing/serialization error.**
+
+The writer and the reader share the same encoding assumption. If that assumption is wrong,
+*both sides make the identical mistake*, the round-trip still closes, and the test is green —
+while real Cassandra-written data reads wrong, and CQLite-written data is unreadable by
+Cassandra. The test validates **self-consistency**, which is not the property that matters.
+It therefore can **never** substitute for a Cassandra-written fixture on any on-disk framing
+or encoding property.
+
+**The concrete instance (issue #3002).** The only arity-2 BTI test,
+`cqlite-core/tests/issue_908_bti_canonical_write.rs`, is CQLite-written and CQLite-read and
+asserts only ordering/structure. It stayed green across a defect pair that cancelled:
+
+1. `resolve_rows_db_entry` computed the signed root-delta base as `RowsOffset + key_length` —
+   **2 bytes low**, because Cassandra 5.0 captures `basePosition` *after*
+   `writeWithShortLength`, i.e. `RowsOffset + 2 + key_length`.
+2. The OSS50 clustering-bound encoders emitted the `0x40 NEXT_COMPONENT` byte only *between*
+   components, while `ClusteringComparator.ByteComparableClustering` emits it before **each**
+   component including the first.
+
+The 2-low root pointed at exactly the subtree the un-prefixed bounds were keyed for, so the
+two errors masked each other perfectly. Fixing *either alone* regresses BTI clustering reads —
+which is precisely why a symmetric test cannot see the pair. It is also why the fixture matters
+independently: the wrong root landed on the root's only child only because that fixture's child
+node happened to be 2 bytes wide (see the fixture-must-vary rule in
+`.claude/skills/test-data-management/SKILL.md`).
+
+**What caught it:** `cqlite-core/tests/issue_3002_bti_rows_root_base.rs`, pinned against the
+real Cassandra 5.0 `da` fixture (`test_da/wide_table`), with every expectation derived from
+Cassandra's own writer/reader source — never from CQLite's prior behavior. That last clause is
+the load-bearing one: an expectation reverse-engineered from current CQLite output re-encodes
+the bug as the specification.
+
+**Rule.** For any on-disk framing/encoding property, the oracle must be **Cassandra-written
+bytes or Cassandra source**, never CQLite's own output. A round-trip test is a useful
+regression net for internal invariants; it is not parity evidence.
+
 ## Golden JSONL files
 
 Every Data.db in the dataset has a companion `.jsonl` file containing

@@ -83,12 +83,30 @@ own CI after the work is complete.
 
 ### Gate completion push-signal (#2667)
 
-The full `agent-gate.sh` fires **one advisory `agent-notify` push** at final-SUMMARY write time (title
+The full `agent-gate.sh` fires **one advisory push** at final-SUMMARY write time (title
 `gate <RESULT> <branch>@<sha>`, body = RESULT + any failing components), converting the summary file from a
 passive poll target into a **push signal**: a backgrounded gate calls its waiting closer/worker back instead
 of being idle-polled. `--lite`/`--delta`/`--only` are exempt (iteration aids, never the gate of record). It
-is advisory by contract — if `agent-notify` is absent or fails, it is a silent no-op and the summary file
-remains the artifact of record, so a broken notifier never changes the gate's verdict.
+is advisory by contract — an absent notifier, an unset target, a failing notifier, or one that **rejects its
+arguments** is a silent no-op and the summary file remains the artifact of record, so a broken notifier never
+changes the gate's verdict.
+
+**The payload contract is REPO-OWNED (#3119).** `scripts/lib/gate-notify.sh` builds the ntfy JSON itself and
+POSTs it to the ntfy **server root** (topic in the body). PASS publishes priority 3 + `white_check_mark`;
+FAIL publishes priority 5 + `rotating_light` — **a red gate is distinguishable at a glance**. This is not
+cosmetic: the gate previously called `agent-notify` with a `--category` flag that upstream v1.1.0 has no arm
+for, so it fell through to manual title/message mode — the title became the literal flag name, the message
+became the category value, the real title/body were dropped, and **every FAIL paged as a green priority-3
+success**; its ntfy path also POSTed the JSON to the topic URL, so phones rendered a raw JSON blob. Two of
+those defects live inside that binary, past any caller-side flag probe, which is why the payload now lives in
+git. `agent-notify` remains only an **optional local desktop/sound adjunct**, invoked positionally (never
+`--category`) with its webhook env neutralized so it cannot double-publish. Configure the target with
+`CODEX_NOTIFY_WEBHOOK=https://ntfy.sh/<topic>` (the fleet uses `/etc/environment`);
+`bash scripts/bootstrap-agent-machine.sh` verifies the **capability** via `gate-notify.sh --self-test` and
+records the pinned contract version. Payload fidelity is pinned by
+`scripts/tests/test_gate_notify_contract.sh` (gate component `tooling-tests`), which asserts the **published
+bytes** at the transport boundary — an argv-level assertion is explicitly not evidence, since that is exactly
+the blind spot the swallowed flag hid behind.
 
 ### GitHub-enforced merge gate (#2433)
 
@@ -144,7 +162,8 @@ roborev pass actually ran on. Three mechanical rules keep the merge honest:
 
 - **Backlog** = GitHub issues; the Project `Status` field is the authoritative lifecycle
   (`Backlog → Ready → In Progress → In Review → Done`). Each issue carries one `P0`–`P3`; `status:*`
-  labels are decorative only (Path A, #1886 — see [the claim board](#the-shared-claim-board)).
+  labels are an **enforced read-mirror of board Status for discovery only** (Path A, #1886; #2855 — see
+  [the claim board](#the-shared-claim-board)).
 - **1:1:1:1** — one issue ↔ one worktree/branch `issue-<N>-<slug>` ↔ one OpenSpec change `<slug>` ↔ one
   PR. Worktrees branch from `origin/main` and lack the gitignored `Data.db` binaries — run the gate with
   `CQLITE_DATASETS_ROOT` pointed at the main repo's `test-data/datasets`.
@@ -166,10 +185,21 @@ board and normalize the `Status` options. The built-in workflow automations (mer
 assigned → `In Progress`) cannot be set via CLI; the script prints the manual web-UI step for them.
 
 **Path A — the board is the sole dispatch authority (issue #1886):** work is selected and claimed by
-the Project `Status` field ONLY. `status:*` labels are **decorative and non-authoritative** — never use
-them to select or claim work. If the `project` scope or the board is **unreachable, STOP and fix the auth**
-(`gh auth refresh -s project`) — do **not** fall back to labels to find work. An empty `Ready` column means
-no work is ready (near a release it is *meant* to drain to zero), not a cue to dredge labels.
+the Project `Status` field ONLY. If the `project` scope or the board is **unreachable, STOP and fix the
+auth** (`gh auth refresh -s project`) — do **not** fall back to labels to select work. An empty `Ready`
+column means no work is ready (near a release it is *meant* to drain to zero), not a cue to dredge labels.
+
+**`status:*` labels — an enforced read-mirror for cheap discovery (issue #2855):** the labels are no
+longer decorative. `.github/workflows/project-board-sync.yml` is the *single writer*, deriving each OPEN
+issue's `status:*` label from its board Status (Ready→`status:ready`, In Progress→`status:in-progress`,
+In Review→`status:in-review`, Backlog/Done→none) on the 30-min sweep + on issue events, with a
+drift-detector that FAILs the run on any label≠Status disagreement. So a session MAY *narrow* candidates
+cheaply and server-side with `gh issue list --state open --label status:ready --json number,title` (no
+issue bodies, no board pagination). But the label is **eventually-consistent (≤30-min lag) and NEVER the
+dispatch/claim authority**: it only narrows the candidate set — the selection decision is by live board
+`Status`, and the claim ref plus a fresh board read at claim time remain the sole double-work arbiter.
+flow-* skills no longer write the board-derived labels (they set board Status only; the mirror follows);
+`status:spec-review`/`status:addressing` stay transient skill-managed sub-markers the mirror does not touch.
 
 ## The claim protocol (no duplicate work)
 
@@ -187,7 +217,8 @@ lock**.
 
 1. **Eligibility** — the item is `Ready` AND has **no** `refs/claims/issue-<N>` claim ref
    (`bash scripts/flow/claim.sh status <N>`) and **no** legacy `issue-<N>-*` branch on origin (mixed-fleet
-   safety; older workers still branch-lock).
+   safety; older workers still branch-lock). A surviving branch over a **free** claim ref is not a dead
+   end — see *Resuming past the legacy-branch guard* below.
 2. **Claim** — `bash scripts/flow/claim.sh claim <N>` acquires the lock (`CLAIM HELD` exit 0 / `CLAIM LOST`
    exit 2); only then create the worktree + branch and set assignee `@me` + `Status=In Progress` for board
    visibility. `flow-activate` claims immediately — before any spec work; oracle-driven issues claim in
@@ -196,10 +227,73 @@ lock**.
    (`claim.sh verify <N>` re-checks holder identity later); on `CLAIM LOST`, back off and take the next
    eligible item.
 
+**Machine prerequisite: git itself must be authenticated (issue #2942).** The lock is a plain `git push`,
+and `gh` auth is a *separate* credential path — a box with an authenticated `gh` CLI but no git credential
+helper fails every claim with `fatal: could not read Username for 'https://github.com'`, so the claim
+protocol does not work at all while `gh auth status` reports a healthy machine. `claim.sh` classifies that
+signature as **`CLAIM: ERROR reason=auth … (NOT retryable)`** naming the fix, *not* the old
+`reason=infra … (transient — retry)` that sent workers into a retry loop on a fault which can never
+self-clear; `reason=infra (transient — retry)` continues to mean a genuine, retryable blip. That
+classification covers `claim.sh` (`claim`/`adopt`/`release`/`smoke`) only — `claim-heartbeat.sh` surfaces
+git's raw error on its own pushes. Fix a box with `gh auth setup-git` or
+`bash scripts/bootstrap-agent-machine.sh --yes`, whose preflight checks git push credentials (configuring
+a helper **scoped to the origin host** that dereferences `$GH_TOKEN` at call time — never writing the
+token to disk; because it reads the environment it works only where `GH_TOKEN` is exported, so prefer
+`gh auth setup-git` for systemd/cron workers) and probes **board access functionally** instead of trusting
+the `project` scope string. Full delta list with the identifying messages:
+`docs/development/fleet-runbook.md`.
+
 Another machine that finds an existing claim can `git fetch` the branch to **resume** that work instead of
 colliding; a **reaped** claim is adopted via compare-and-swap — `claim.sh adopt <N> --expect <old-sha>`,
 which replaces the ref with force-with-lease so a resurrected original holder loses the lease and detects
-the loss immediately (fixes the #2467/#2499 two-writer race). The claiming session also maintains a
+the loss immediately (fixes the #2467/#2499 two-writer race).
+
+**Resuming past the legacy-branch guard (issue #2945)** — when the claim ref is **free** but an
+`issue-<N>-*` branch still stands on origin (a parked/reaped/released claim, an owner-approved spec that
+lives on that branch, or just a merged-but-undeleted PR branch), `claim` refuses with
+`reason=legacy-branch-lock … claim-ref=free resume=documented-procedure`. That refusal is a
+**diagnosis, not a hand-off**: it names the blocking branch(es) and tells you the claim ref itself is
+free, then points here. The ONE sanctioned resume is documented *only* here and in
+`claim.sh -h` — it is deliberately **never printed as a runnable line** (see below):
+
+```bash
+bash scripts/flow/claim.sh adopt 1234 --expect none --reason resume-legacy-branch-lock:branch-outlived-claim
+```
+
+`--expect none` is git's **empty lease** ("this ref must not exist"), so the create is still arbitrated
+server-side: a machine that actually holds the claim ref keeps it and the resumer gets `ADOPT-LOST`
+(exit 2), and two machines racing the resume still yield exactly one winner. `--reason` is **required** —
+it is recorded in the claim commit next to who took it (machine/actor/ts) and rendered by
+`claim.sh status`, so a resume is auditable; a reason with nothing recordable in it (`'   '`, `'---'`, an
+unset variable) is a **usage error** (exit 64), never a silent `reason=unspecified` — and so is a bare
+**placeholder** (`why`, `todo`, `tbd`, `xxx`, …) or a reason still carrying an **unsubstituted `<…>`**
+(a copied `--reason resume-legacy-branch-lock:<branch>` sanitizes to a non-sentinel token, so it is
+rejected on the raw text): the record must say why. That is also why the example above substitutes a
+concrete issue number and reason — the documented invocation is one that works when run verbatim.
+`--actor` is fail-closed the same way (an actor with nothing recordable in it would alias two distinct
+identities onto one holder, and the actor gates re-entrancy/`verify`/`release`). A hex
+`--expect` must be a **full** object name (40/64 hex) — a truncated sha is a usage error, not a lost race.
+
+**Why the command is never printed for you (owner decision, #2945).** `claim.sh` used to decide, from an
+in-script liveness probe, whether to print a copy-pasteable version of that command. That probe is gone.
+The readers of a refusal are agents that run printed remediations **literally**, and an older-fleet worker
+locks with the *branch* while holding **no claim ref** (`claim-ref=free` is true for it) — so a printed
+empty-lease adopt would take an **actively-worked** lane and create a second writer. Judging abandonment
+needs signals `claim.sh` cannot read soundly, and three successive revisions of the probe each shipped a
+fresh version of that hazard (a vacuous branch-tip date, a cross-process ref race, a fleet-wide permanent
+withhold). So the refusal diagnoses and points here, and **you** establish abandonment first with the same
+test `flow-board`'s reaper uses:
+
+```bash
+bash scripts/flow/claim-heartbeat.sh should-reap <machine>   # exit 0 = reapable, 1 = keep, 2 = no ref
+```
+
+i.e. claim age > 4h **and** no open PR **and** (pid-dead, when the claim is local) — plus the board
+`Status` and the branch/PR author. Only then run the documented resume. Retrying after a transient
+`ERROR reason=infra` is safe: an
+adopt whose ref is already held by *this* machine+actor reports `ADOPTED … (re-entrant)` exit 0 rather
+than abandoning an issue you own. This is the only sanctioned way past that refusal — **never hand-craft
+a claim commit or push the ref directly** (the field failure that motivated #2945). The claiming session also maintains a
 liveness **heartbeat** (`scripts/flow/claim-heartbeat.sh beat <N>` — a cheap origin git ref under
 `refs/heartbeats/<machine>`, never a GitHub API call — refreshed at claim time and on every stage
 transition: activate/implement/gate/PR). `flow-board` reaps **abandoned claims deterministically** (issue
@@ -316,7 +410,10 @@ implement (TDD) → lite (each fix round) → rust-reviewer + roborev on the lit
 - **The disposable `flow-closer` owns the endgame (issue #2084/#2668).** `flow-implement` opens the PR, then
   spawns a per-issue `flow-closer` that runs the ONE full `scripts/agent-gate.sh` of record (via
   `run_in_background` + the summary-file pattern — it **never idle-waits**, which would trip the #1855 stall
-  watchdog and orphan the gate; polling the summary file is mandatory on a hard 45-min deadline), the **C**
+  watchdog and orphan the gate; polling the summary file is mandatory on a hard 45-min deadline, with
+  `grep -qE 'RESULT: (PASS|FAIL)'` — never a bare `grep -q` on the bare `RESULT:` token, which also matches the startup
+  `RESULT: INCOMPLETE` liveness placeholder and would accept a just-launched gate as a verdict, #3041),
+  the **C**
   intent audit, the final roborev pass, then merges on green and `flow-finalize`s. The closer has **no
   `Agent` tool**, so it never spawns directly: for **C** (and any src-design fix) it emits a structured
   `NEEDS-SPAWN` packet and ends its turn — the lead spawns `spec-auditor`/`sstable-developer` and re-invokes
@@ -348,9 +445,45 @@ same board-only rehydration rule applies to worker sessions (see the supervisor 
 A fresh machine that will run the pipeline should first run
 `bash scripts/bootstrap-agent-machine.sh` (details in `docs/development/agent-machine-setup.md`): it
 verifies the gate accelerators (`sccache`, `cargo-nextest`, modern bash — issue #1848), the datasets +
-`CQLITE_DATASETS_ROOT`, `gh` auth + the `project` scope, and roborev's local config. **roborev follows the
-machine's configured agent** (commonly `codex` via `.roborev.toml`; no flags) — explicit `--agent`/`--model`
-is a per-machine troubleshooting override only, never doctrine.
+`CQLITE_DATASETS_ROOT`, `gh` auth + the `project` scope, and roborev's local config. **roborev is invoked
+ONLY through the fail-closed wrapper `bash scripts/flow/roborev-review.sh --agent <agent> --model <model>
+[--repo <abs-path>] [--base <ref>]`** (#2964) — fleet form `--agent codex --model gpt-5.6-sol`; the Claude
+reviewer is `--agent claude-code --model claude-opus-5`. **BOTH `--agent` and `--model` are ALWAYS
+required** (the wrapper rejects a missing one as a usage error; one alone inherits the mismatched
+`.roborev.toml`-pinned model and fails as a silent-looking review outage), and the branch must be **pushed
+first** — the wrapper asserts that and FAILs otherwise. Three direct-CLI forms are **NON-SANCTIONED**:
+`roborev review --branch` **without an explicit `--repo`** (from a worktree it resolves against the ROOT
+checkout), the two-positional commit-range form (its range base is git's empty tree), and a single-SHA
+review (it reviews **one commit, not the branch**). Each can report clean having reviewed NOTHING — or, for
+the single-SHA form, only the last commit — and a vacuous pass is textually identical to a genuine one.
+Measured: **`--repo` is what makes `--branch` correct**, so the wrapper reviews the RANGE `<base>..HEAD` and
+verifies BOTH endpoints against the job record (`reviewed-sha:` is a range, not a sha; `job-record:` reports
+the record's completeness). Note too that **roborev drops exactly what its configured `exclude_patterns` pathspecs match — it makes no
+code/non-code judgement** — so a docs-only diff cannot be roborev-certified at all. "docs-only" means a
+**code-free CENSUS**, never a `docs/` path prefix: the `docs/reports/*-artifacts/` measurement harnesses
+this repo ships by convention are executable code that IS reviewed, so a PR carrying them must be
+certified like any other code change (#3229). The remedy that shipped is the **configuration**: a narrowed
+prose/artifact deny-list (`*.md` plus artifact extensions scoped to artifact-bearing *directories*, never a
+blanket `docs/**` — which is what swallowed 33 harness executables on PR #3222), measured at 72 `docs/`
+executables reaching the reviewer and 0 markdown.
+**NOTHING PREDICTS THE EXCLUSION SET PRE-ENQUEUE (#3283 configured, #3278 compiled-in).** A key that did
+was built on #3229 and REMOVED by owner ruling: its false-PASS count was *increasing* across review rounds,
+and **a guard with known documented false-PASSes is worse than no guard, because it invites reliance it
+cannot support**. So a swallowed path — by configuration or by roborev's compiled-in lockfile/cache
+deny-list (`**/Cargo.lock`, `**/go.sum`, `**/pnpm-lock.yaml`, …) — surfaces **after** the review under
+**`prompt-content:`**, fail-closed, with a cause that names the symptom rather than the mechanism.
+Practically: **if `prompt-content:` FAILs, suspect `.roborev.toml` first**; a lockfile-only dependency bump
+is still **not** roborev-certifiable; and `prompt-content:` can never print a `PASS (0/0 …)`. Verdicts still
+follow one rule — **FAIL where the author can act; NOTICE where only the information is actionable; never
+silence** — and no key is exempt from the affirmation backstop: all six deterministic keys must be
+affirmatively `PASS`, matched on the exact verdict token, never a prefix glob.
+Note also that **a `.roborev.toml` change cannot certify itself**: roborev reads `exclude_patterns` from the
+repo **root path** and snapshots it at daemon start, so a worktree edit is invisible and the demonstration
+belongs after the merge — generally, *any PR whose subject is a config a daemon or gate reads from root
+cannot certify itself*. **Any** non-PASS terminal `RESULT` —
+`NOTHING-TO-REVIEW` included — is a failed review round and a blocked merge, never a clean pass. Verify
+which reviewer a box can actually serve with `roborev check-agents`; why:
+[roborev findings](/cqlite/agents-developing/roborev-findings/) + CLAUDE.md.
 
 ## Pipelining independent lanes (retro #1889)
 
